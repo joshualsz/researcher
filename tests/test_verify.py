@@ -63,5 +63,24 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual((r["found"], r["location"]), (True, None))
 
 
+class WordBoundaryTests(unittest.TestCase):
+    SRC = ("Training remained unstable throughout, and accuracy improved by 12% overall. "
+           "It is impossible to scale this approach.")
+
+    def test_fragment_starting_mid_word_rejected(self):
+        r = papers.verify_quote(self.SRC, "stable throughout, and accuracy improved")
+        self.assertFalse(r["found"])
+
+    def test_fragment_ending_mid_number_rejected(self):
+        self.assertFalse(papers.verify_quote(self.SRC, "accuracy improved by 1")["found"])
+
+    def test_fragment_that_flips_meaning_rejected(self):
+        self.assertFalse(papers.verify_quote(self.SRC, "possible to scale this approach")["found"])
+
+    def test_quote_ending_in_symbol_still_found(self):
+        r = papers.verify_quote(self.SRC, "accuracy improved by 12%")
+        self.assertTrue(r["found"])
+
+
 if __name__ == "__main__":
     unittest.main()

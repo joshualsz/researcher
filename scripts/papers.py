@@ -2,6 +2,7 @@
 """Helper for the paper-researcher agent: search, fetch and verify quotes."""
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -48,15 +49,22 @@ def segments(text):
     return segs
 
 
+def _contains(haystack, needle):
+    """Substring match that must not start or end in the middle of a word or number."""
+    pre = r"(?<!\w)" if re.match(r"\w", needle) else ""
+    post = r"(?!\w)" if re.search(r"\w$", needle) else ""
+    return re.search(pre + re.escape(needle) + post, haystack) is not None
+
+
 def verify_quote(source, quote):
     q = normalize(quote, join_hyphens=False)
     if len(q) < MIN_QUOTE_CHARS:
         return {"found": False, "location": None, "reason": "too short"}
     variants = (True, False)
-    if not any(q in normalize(source, j) for j in variants):
+    if not any(_contains(normalize(source, j), q) for j in variants):
         return {"found": False, "location": None, "reason": "not found in text"}
     for label, body in segments(source):
-        if any(q in normalize(body, j) for j in variants):
+        if any(_contains(normalize(body, j), q) for j in variants):
             return {"found": True, "location": label, "reason": None}
     return {"found": True, "location": None, "reason": None}
 
@@ -81,19 +89,29 @@ def load_meta(paper_id):
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
-def http_get(url, retries=1, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": "paper-researcher/0.1"})
+def _retry_delay(retry_after, attempt):
+    """Seconds to wait before retrying: Retry-After if numeric, else 2, 4, 8... (max 30)."""
+    if retry_after and retry_after.isdigit():
+        return min(int(retry_after), 30)
+    return min(2 ** (attempt + 1), 30)
+
+
+def http_get(url, retries=3, timeout=30, headers=None):
+    req = urllib.request.Request(
+        url, headers=dict({"User-Agent": "paper-researcher/0.1"}, **(headers or {})))
     for attempt in range(retries + 1):
+        retry_after = None
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
         except urllib.error.HTTPError as e:
             if e.code == 404 or attempt == retries:
                 raise
+            retry_after = e.headers.get("Retry-After")
         except (urllib.error.URLError, TimeoutError):
             if attempt == retries:
                 raise
-        time.sleep(2)
+        time.sleep(_retry_delay(retry_after, attempt))
 
 
 def _terms(query):
@@ -222,13 +240,16 @@ def search_arxiv(query, limit):
 
 
 def search_s2(query, limit):
-    return parse_s2(http_get(s2_url(query, limit)).decode("utf-8"))
+    key = os.environ.get("S2_API_KEY")
+    headers = {"x-api-key": key} if key else None
+    return parse_s2(http_get(s2_url(query, limit), headers=headers).decode("utf-8"))
 
 
 def search(query, limit=10):
     _terms(query)  # raise a clear error on empty queries
     found, warnings = [], []
-    for name, fn in (("arxiv", search_arxiv), ("semanticscholar", search_s2)):
+    sources = (("arxiv", search_arxiv), ("semanticscholar", search_s2))
+    for name, fn in sources:
         try:
             found += fn(query, limit)
         except Exception as e:  # skip a failing source, report it
@@ -236,7 +257,7 @@ def search(query, limit=10):
     result = dedupe(found)
     for p in result:
         save_meta(p)
-    return {"papers": result, "warnings": warnings}
+    return {"papers": result, "warnings": warnings, "ok": len(warnings) < len(sources)}
 
 
 MIN_FULLTEXT_CHARS = 2000
@@ -338,10 +359,7 @@ def _cached(paper_id):
     return None, None
 
 
-def fetch(paper_id):
-    path, source_type = _cached(paper_id)
-    if path:
-        return {"id": paper_id, "path": str(path), "source_type": source_type}
+def _fetch_full_text(paper_id):
     text = None
     if paper_id.startswith("arxiv:"):
         aid = paper_id[6:]
@@ -352,9 +370,19 @@ def fetch(paper_id):
         meta = load_meta(paper_id)
         if meta and meta.get("pdf_url"):
             text = try_pdf(meta["pdf_url"])
-    if text and len(text) >= MIN_FULLTEXT_CHARS:
+    return text if text and len(text) >= MIN_FULLTEXT_CHARS else None
+
+
+def fetch(paper_id):
+    path, source_type = _cached(paper_id)
+    if source_type == "full_text":
+        return {"id": paper_id, "path": str(path), "source_type": source_type}
+    text = _fetch_full_text(paper_id)  # an abstract-only cache may be a transient failure
+    if text:
         path = _write_text(paper_id, "full", text)
         return {"id": paper_id, "path": str(path), "source_type": "full_text"}
+    if path:
+        return {"id": paper_id, "path": str(path), "source_type": source_type}
     abstract = get_abstract(paper_id)
     if abstract:
         path = _write_text(paper_id, "abstract", abstract)
@@ -382,17 +410,20 @@ def main(argv=None):
     f.add_argument("id")
     v = sub.add_parser("verify")
     v.add_argument("id")
-    v.add_argument("quote")
+    v.add_argument("quote", nargs="?", default="-",
+                   help="quote text, or - (default) to read it from stdin")
     args = ap.parse_args(argv)
     code = 0
     try:
         if args.cmd == "search":
             out = search(args.query, args.limit)
+            code = 0 if out["ok"] else 3
         elif args.cmd == "fetch":
             out = fetch(args.id)
             code = 0 if out["path"] else 1
         else:
-            out = verify_paper(args.id, args.quote)
+            quote = sys.stdin.read() if args.quote == "-" else args.quote
+            out = verify_paper(args.id, quote)
             code = 0 if out["found"] else 1
     except ValueError as e:
         out, code = {"error": str(e)}, 2

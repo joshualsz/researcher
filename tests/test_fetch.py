@@ -80,6 +80,25 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(r["source_type"], "full_text")
         pdf.assert_called_once_with("https://e.org/p.pdf")
 
+    def test_abstract_only_cache_is_retried_and_upgraded(self):
+        with mock.patch.object(papers, "try_arxiv_html", return_value=None), \
+             mock.patch.object(papers, "try_pdf", return_value=None), \
+             mock.patch.object(papers, "get_abstract", return_value="An abstract."):
+            first = papers.fetch("arxiv:2301.12345")
+        self.assertEqual(first["source_type"], "abstract_only")
+        with mock.patch.object(papers, "try_arxiv_html", return_value=LONG_TEXT):
+            second = papers.fetch("arxiv:2301.12345")
+        self.assertEqual(second["source_type"], "full_text")
+        self.assertTrue(second["path"].endswith(".full.txt"))
+
+    def test_abstract_only_cache_kept_when_retry_fails(self):
+        with mock.patch.object(papers, "try_arxiv_html", return_value=None), \
+             mock.patch.object(papers, "try_pdf", return_value=None), \
+             mock.patch.object(papers, "get_abstract", return_value="An abstract."):
+            papers.fetch("arxiv:2301.12345")
+            again = papers.fetch("arxiv:2301.12345")
+        self.assertEqual(again["source_type"], "abstract_only")
+
     def test_second_fetch_uses_cache(self):
         with mock.patch.object(papers, "try_arxiv_html", return_value=LONG_TEXT):
             papers.fetch("arxiv:2301.12345")
@@ -115,6 +134,20 @@ class VerifyPaperTests(unittest.TestCase):
         r = papers.verify_paper("arxiv:999", "Some long enough quote text here")
         self.assertFalse(r["found"])
         self.assertEqual(r["reason"], "not fetched")
+
+
+class VerifyStdinTests(unittest.TestCase):
+    def test_quote_read_from_stdin_is_not_shell_expanded(self):
+        import io
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        text = "Cost is $(rm -rf x) `id` and \"quoted\" text, per the authors."
+        (Path(tmp.name) / "arxiv_3.full.txt").write_text(text, encoding="utf-8")
+        with mock.patch.object(papers, "TEXT_DIR", Path(tmp.name)), \
+             mock.patch("sys.stdin", io.StringIO(text + "\n")), \
+             mock.patch("sys.stdout", io.StringIO()):
+            code = papers.main(["verify", "arxiv:3", "-"])
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import io
 import json
 import sys
 import unittest
@@ -105,6 +106,48 @@ class UrlTests(unittest.TestCase):
             papers.arxiv_url("  ", 5)
         with self.assertRaises(ValueError):
             papers.s2_url("", 5)
+
+
+class RetryDelayTests(unittest.TestCase):
+    def test_honours_retry_after_header_capped(self):
+        self.assertEqual(papers._retry_delay("5", 0), 5)
+        self.assertEqual(papers._retry_delay("999", 0), 30)
+
+    def test_exponential_backoff_without_header(self):
+        self.assertEqual([papers._retry_delay(None, a) for a in range(3)], [2, 4, 8])
+        self.assertEqual(papers._retry_delay("Wed, 21 Oct 2026", 1), 4)
+
+
+class SearchOkTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for name in ("META_DIR",):
+            m = mock.patch.object(papers, name, Path(self.tmp.name))
+            m.start()
+            self.addCleanup(m.stop)
+
+    def test_all_sources_failing_is_not_ok(self):
+        from unittest import mock
+        with mock.patch.object(papers, "search_arxiv", side_effect=OSError("boom")), \
+             mock.patch.object(papers, "search_s2", side_effect=OSError("429")):
+            r = papers.search("topic")
+        self.assertFalse(r["ok"])
+        self.assertEqual(len(r["warnings"]), 2)
+        with mock.patch.object(papers, "search", return_value=r), \
+             mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(papers.main(["search", "topic"]), 3)
+
+    def test_one_source_failing_is_still_ok(self):
+        from unittest import mock
+        with mock.patch.object(papers, "search_arxiv", side_effect=OSError("boom")), \
+             mock.patch.object(papers, "search_s2",
+                               return_value=papers.parse_s2(S2_JSON)[:1]):
+            r = papers.search("topic")
+        self.assertTrue(r["ok"])
+        self.assertEqual(len(r["papers"]), 1)
 
 
 if __name__ == "__main__":

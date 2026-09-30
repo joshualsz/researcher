@@ -20,6 +20,10 @@ The report is saved to `research/<topic-slug>.md`.
 
 `pdftotext` (poppler, `brew install poppler`) is optional. Without it, papers that lack an arXiv HTML version fall back to abstract-only, and the report labels them.
 
+## Rate limits
+
+arXiv and Semantic Scholar throttle anonymous requests. `papers.py` retries with backoff (honouring `Retry-After`). If Semantic Scholar keeps returning HTTP 429, set a free API key: `export S2_API_KEY=...`. When every source fails, `search` exits 3 and the agent stops instead of writing a report.
+
 ## Tests
 
 ```bash
