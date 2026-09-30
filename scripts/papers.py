@@ -237,3 +237,168 @@ def search(query, limit=10):
     for p in result:
         save_meta(p)
     return {"papers": result, "warnings": warnings}
+
+
+MIN_FULLTEXT_CHARS = 2000
+
+
+class _TextExtractor(HTMLParser):
+    SKIP = {"script", "style", "nav", "header", "footer", "noscript"}
+    HEADINGS = {"h1", "h2", "h3", "h4"}
+    BLOCK = {"p", "div", "li", "br", "tr", "section", "figure", "table", "blockquote"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip = 0
+        self._math = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        elif tag == "math":
+            self._math += 1
+            if self._math == 1 and not self._skip:
+                self.parts.append(dict(attrs).get("alttext") or "")
+        elif self._skip or self._math:
+            return
+        elif tag in self.HEADINGS:
+            self.parts.append("\n## ")
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP:
+            self._skip = max(0, self._skip - 1)
+        elif tag == "math":
+            self._math = max(0, self._math - 1)
+        elif self._skip or self._math:
+            return
+        elif tag in self.HEADINGS or tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not (self._skip or self._math):
+            self.parts.append(data)
+
+
+def html_to_text(html):
+    parser = _TextExtractor()
+    parser.feed(html)
+    return re.sub(r"\n{3,}", "\n\n", "".join(parser.parts)).strip()
+
+
+def try_arxiv_html(aid):
+    try:
+        html = http_get("https://arxiv.org/html/" + aid).decode("utf-8", "replace")
+        return html_to_text(html)
+    except Exception:
+        return None
+
+
+def try_pdf(url):
+    if not shutil.which("pdftotext"):
+        return None
+    try:
+        data = http_get(url, timeout=60)
+        proc = subprocess.run(["pdftotext", "-", "-"], input=data,
+                              capture_output=True, timeout=120)
+    except Exception:
+        return None
+    return proc.stdout.decode("utf-8", "replace") if proc.returncode == 0 else None
+
+
+def get_abstract(paper_id):
+    meta = load_meta(paper_id)
+    if meta and meta.get("abstract"):
+        return meta["abstract"]
+    if paper_id.startswith("arxiv:"):
+        try:
+            found = parse_arxiv(http_get(arxiv_id_url(paper_id[6:])).decode("utf-8"))
+        except Exception:
+            return ""
+        if found:
+            save_meta(found[0])
+            return found[0]["abstract"]
+    return ""
+
+
+def _write_text(paper_id, kind, text):
+    TEXT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TEXT_DIR / ("%s.%s.txt" % (safe_name(paper_id), kind))
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _cached(paper_id):
+    for kind, source_type in (("full", "full_text"), ("abstract", "abstract_only")):
+        path = TEXT_DIR / ("%s.%s.txt" % (safe_name(paper_id), kind))
+        if path.exists():
+            return path, source_type
+    return None, None
+
+
+def fetch(paper_id):
+    path, source_type = _cached(paper_id)
+    if path:
+        return {"id": paper_id, "path": str(path), "source_type": source_type}
+    text = None
+    if paper_id.startswith("arxiv:"):
+        aid = paper_id[6:]
+        text = try_arxiv_html(aid)
+        if not text or len(text) < MIN_FULLTEXT_CHARS:
+            text = try_pdf("https://arxiv.org/pdf/" + aid)
+    else:
+        meta = load_meta(paper_id)
+        if meta and meta.get("pdf_url"):
+            text = try_pdf(meta["pdf_url"])
+    if text and len(text) >= MIN_FULLTEXT_CHARS:
+        path = _write_text(paper_id, "full", text)
+        return {"id": paper_id, "path": str(path), "source_type": "full_text"}
+    abstract = get_abstract(paper_id)
+    if abstract:
+        path = _write_text(paper_id, "abstract", abstract)
+        return {"id": paper_id, "path": str(path), "source_type": "abstract_only"}
+    return {"id": paper_id, "path": None, "source_type": "unavailable"}
+
+
+def verify_paper(paper_id, quote):
+    path, source_type = _cached(paper_id)
+    if not path:
+        return {"found": False, "location": None, "reason": "not fetched",
+                "source_type": "unavailable"}
+    result = verify_quote(path.read_text(encoding="utf-8"), quote)
+    result["source_type"] = source_type
+    return result
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="papers.py")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("search")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=10)
+    f = sub.add_parser("fetch")
+    f.add_argument("id")
+    v = sub.add_parser("verify")
+    v.add_argument("id")
+    v.add_argument("quote")
+    args = ap.parse_args(argv)
+    code = 0
+    try:
+        if args.cmd == "search":
+            out = search(args.query, args.limit)
+        elif args.cmd == "fetch":
+            out = fetch(args.id)
+            code = 0 if out["path"] else 1
+        else:
+            out = verify_paper(args.id, args.quote)
+            code = 0 if out["found"] else 1
+    except ValueError as e:
+        out, code = {"error": str(e)}, 2
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
