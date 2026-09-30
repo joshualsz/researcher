@@ -23,8 +23,15 @@ META_DIR = CACHE_DIR / "meta"
 MIN_QUOTE_CHARS = 20
 
 
+SUPERSCRIPTS = str.maketrans("\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079\u207a\u207b",
+                             "0123456789+-")
+SUPERSCRIPT_RUN = re.compile("[" + "".join(chr(c) for c in SUPERSCRIPTS) + "]+")
+
+
 def normalize(text, join_hyphens=True):
     """Lowercase and flatten text so PDF/HTML artefacts don't defeat matching."""
+    # 10\u2076 -> 10^6, so NFKC can't silently turn a superscript into a plain digit
+    text = SUPERSCRIPT_RUN.sub(lambda m: "^" + m.group().translate(SUPERSCRIPTS), text)
     text = unicodedata.normalize("NFKC", text)  # also expands ligatures
     text = text.replace("­", "")  # soft hyphen
     text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2" if join_hyphens else r"\1-\2", text)

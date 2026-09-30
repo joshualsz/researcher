@@ -82,5 +82,19 @@ class WordBoundaryTests(unittest.TestCase):
         self.assertTrue(r["found"])
 
 
+class SuperscriptTests(unittest.TestCase):
+    def test_superscripts_become_caret_notation(self):
+        self.assertEqual(papers.normalize("10\u2076 tokens"), "10^6 tokens")
+        self.assertEqual(papers.normalize("10\u207b\u00b3"), "10^-3")
+
+    def test_caret_quote_matches_superscript_source(self):
+        src = "The model saw about 10\u2076 tokens per step."
+        self.assertTrue(papers.verify_quote(src, "saw about 10^6 tokens per step")["found"])
+
+    def test_superscript_is_not_flattened_to_plain_digit(self):
+        src = "The model saw about 10\u2076 tokens per step."
+        self.assertFalse(papers.verify_quote(src, "saw about 106 tokens per step")["found"])
+
+
 if __name__ == "__main__":
     unittest.main()
